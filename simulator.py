@@ -130,7 +130,7 @@ def load_model():
 
 @st.cache_data
 def load_dataset():
-    df = pd.read_csv(r"C:\Users\migue\OneDrive\Documentos\ProyectoSoccerSolver\TFM\dataset_model_2425.csv")
+    df = pd.read_csv("dataset_model_2425.csv")
     return df
 
 artifact = load_model()

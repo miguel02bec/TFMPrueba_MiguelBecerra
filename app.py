@@ -15,7 +15,7 @@ import plotly.express as px
 
 # ── Configuración ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="SoccerSolver - Market Value Simulator",
+    page_title="Market Value Simulator",
     page_icon="⚽",
     layout="wide",
 )
@@ -133,8 +133,8 @@ def format_value(value_eur: float) -> str:
 
 
 # ── Cabecera ─────────────────────────────────────────────────
-st.title("⚽ SoccerSolver — Market Value Simulator")
-st.markdown("Simulador **what-if** de valor de mercado con modelos XGBoost estratificados por posición y explicabilidad SHAP.")
+st.title("Market Value Simulator")
+st.markdown(""Busca un jugador, ajusta sus atributos y observa cómo cambia su valor de mercado.")
 st.divider()
 
 # ── Sidebar: guardar escenarios ─────────────────────────────────

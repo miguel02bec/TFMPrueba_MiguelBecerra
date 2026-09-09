@@ -38,40 +38,52 @@ POSITION_GROUPS = {
 # Features por grupo. age y contract_years_left estan en los 4 grupos porque
 # el simulador (app.py) tiene sliders de edad y anios de contrato que solo
 # mueven la prediccion si el modelo los usa como feature.
+# avg_rating se quito por fuga (el rating medio de SofaScore ya recoge una
+# valoracion casi directa del jugador, correlacionada con su valor de
+# mercado). matches_played y total_matches_missed se quitaron por
+# multicolinealidad (redundantes entre si y con total_minutes /
+# avg_days_per_injury).
 FEATURES_BY_GROUP = {
     "GK": [
-        "total_minutes", "avg_rating",
-        "passes_p90", "pass_accuracy",
-        "total_matches_missed", "avg_days_per_injury",
+        "total_minutes",
+        "passes_p90", "pass_accuracy", "saves_p90",
+        "avg_days_per_injury",
         "age", "contract_years_left",
     ],
     "DEF": [
-        "total_minutes", "avg_rating",
+        "total_minutes",
         "passes_p90", "pass_accuracy", "key_passes_p90",
         "duels_won_p90", "interceptions_p90", "tackles_p90",
         "goals_p90", "assists_p90",
-        "total_matches_missed", "avg_days_per_injury",
+        "avg_days_per_injury",
         "age", "contract_years_left",
     ],
     "MID": [
-        "total_minutes", "avg_rating",
+        "total_minutes",
         "goals_p90", "assists_p90", "shots_p90",
         "xg_p90", "key_passes_p90", "pass_accuracy",
         "duels_won_p90", "interceptions_p90",
-        "total_matches_missed", "avg_days_per_injury",
+        "avg_days_per_injury",
         "age", "contract_years_left",
     ],
     "FWD": [
-        "total_minutes", "avg_rating",
+        "total_minutes",
         "goals_p90", "assists_p90", "shots_p90",
         "xg_p90", "key_passes_p90", "pass_accuracy",
         "duels_won_p90",
-        "total_matches_missed", "avg_days_per_injury",
+        "avg_days_per_injury",
         "age", "contract_years_left",
     ],
 }
 
 TARGET_COLUMN = "log_target_value"
+LEAGUE_COLUMN = "league"
+
+# Columna de fuga: es una estimacion de valor de mercado de la propia fuente
+# SofaScore, correlacionada casi directamente con el target (market_value_eur /
+# log_target_value). Se descarta tanto del dataset como de las features de
+# entrenamiento.
+LEAKAGE_COLUMNS = ["market_value_sofascore"]
 
 # Semilla unica compartida por el split de CV y por los modelos, para que
 # todo el script sea reproducible con un solo numero.
@@ -144,7 +156,7 @@ def validar_columnas(df: pd.DataFrame) -> None:
     """Comprueba que estan todas las columnas necesarias antes de entrenar,
     para fallar con un mensaje claro en vez de un KeyError generico a mitad
     de entrenamiento."""
-    columnas_necesarias = {"position", TARGET_COLUMN}
+    columnas_necesarias = {"position", TARGET_COLUMN, LEAGUE_COLUMN}
     for features in FEATURES_BY_GROUP.values():
         columnas_necesarias.update(features)
 
@@ -156,11 +168,33 @@ def validar_columnas(df: pd.DataFrame) -> None:
         )
 
 
-def evaluar_modelo(params: dict, X: pd.DataFrame, y: pd.Series, group_name: str) -> float:
-    """Valida con K-Fold CV y devuelve el R2 medio, para comprobar que
-    entrena razonablemente antes de ajustar el modelo final. Crea un
-    XGBRegressor nuevo en cada fold: nunca reutiliza ni muta el modelo que
-    luego se entrena con el 100% de los datos y se guarda en el .pkl."""
+def quitar_columnas_fuga(df: pd.DataFrame) -> pd.DataFrame:
+    """Elimina del dataset las columnas de fuga antes de que puedan llegar a
+    usarse como feature en ningun grupo."""
+    presentes = [c for c in LEAKAGE_COLUMNS if c in df.columns]
+    if presentes:
+        logger.info("Quitando columnas de fuga del dataset: %s", presentes)
+        df = df.drop(columns=presentes)
+    return df
+
+
+def construir_matriz(df_slice: pd.DataFrame, base_features: list, league_categories: list) -> pd.DataFrame:
+    """Construye la matriz de diseño (features numericas + liga one-hot) para
+    un grupo de posicion. La liga se fija como Categorical con las categorias
+    de TODO el dataset (no solo las del grupo/fold) para que las columnas
+    dummy resultantes sean siempre las mismas, entrene con el grupo completo,
+    con un fold de CV, o con un solo jugador en el simulador."""
+    sub = df_slice[base_features + [LEAGUE_COLUMN]].copy()
+    sub[LEAGUE_COLUMN] = pd.Categorical(sub[LEAGUE_COLUMN], categories=league_categories)
+    return pd.get_dummies(sub, columns=[LEAGUE_COLUMN])
+
+
+def evaluar_modelo(params: dict, X: pd.DataFrame, y: pd.Series, group_name: str) -> tuple:
+    """Valida con K-Fold CV y devuelve (R2 medio, R2 desviacion tipica), para
+    comprobar que entrena razonablemente antes de ajustar el modelo final.
+    Crea un XGBRegressor nuevo en cada fold: nunca reutiliza ni muta el
+    modelo que luego se entrena con el 100% de los datos y se guarda en el
+    .pkl."""
     kf = KFold(n_splits=N_CV_FOLDS, shuffle=True, random_state=SEED)
     mae_scores, rmse_scores, r2_scores = [], [], []
 
@@ -177,14 +211,16 @@ def evaluar_modelo(params: dict, X: pd.DataFrame, y: pd.Series, group_name: str)
                     group_name, fold + 1, mae_scores[-1], rmse_scores[-1], r2_scores[-1])
 
     r2_medio = float(np.mean(r2_scores))
+    r2_std = float(np.std(r2_scores))
     logger.info("[%s] Media CV - MAE: %.3f | RMSE: %.3f | R2: %.3f +/- %.3f",
                 group_name, np.mean(mae_scores), np.mean(rmse_scores),
-                r2_medio, np.std(r2_scores))
-    return r2_medio
+                r2_medio, r2_std)
+    return r2_medio, r2_std
 
 
-def entrenar_grupo(df: pd.DataFrame, group: str, features: list) -> dict:
-    """Entrena y explica (SHAP) el modelo de un grupo de posicion."""
+def entrenar_grupo(df: pd.DataFrame, group: str, base_features: list, league_categories: list) -> dict:
+    """Entrena y explica (SHAP) el modelo de un grupo de posicion. La liga se
+    añade como one-hot junto a las features numericas del grupo."""
     df_group = df[df["position_group"] == group].copy()
     logger.info("Grupo %s - %d jugadores", group, len(df_group))
 
@@ -195,8 +231,9 @@ def entrenar_grupo(df: pd.DataFrame, group: str, features: list) -> dict:
             f"el dataset o baja N_CV_FOLDS."
         )
 
-    X = df_group[features]
+    X = construir_matriz(df_group, base_features, league_categories)
     y = df_group[TARGET_COLUMN]
+    features = list(X.columns)
 
     nulos = X.isna().sum()
     for feature, n_nulos in nulos[nulos > 0].items():
@@ -204,7 +241,7 @@ def entrenar_grupo(df: pd.DataFrame, group: str, features: list) -> dict:
                     group, feature, n_nulos, len(X), 100 * n_nulos / len(X))
 
     params = MODEL_PARAMS_BY_GROUP[group]
-    r2_cv = evaluar_modelo(params, X, y, group)
+    r2_cv, r2_cv_std = evaluar_modelo(params, X, y, group)
 
     model = xgb.XGBRegressor(**params)  # instancia nueva para el modelo final
     model.fit(X, y)  # reentrena con todos los datos del grupo tras validar
@@ -213,13 +250,15 @@ def entrenar_grupo(df: pd.DataFrame, group: str, features: list) -> dict:
 
     return {
         "model": model,
+        "base_features": base_features,
         "features": features,
         "explainer": explainer,
         "r2_cv": r2_cv,
+        "r2_cv_std": r2_cv_std,
     }
 
 
-def construir_metadata(df: pd.DataFrame, modelos: dict) -> dict:
+def construir_metadata(df: pd.DataFrame, modelos: dict, league_categories: list) -> dict:
     """Recoge version de librerias y metricas de entrenamiento junto al
     .pkl, para poder diagnosticar en el futuro con que datos/entorno se
     entreno sin tener que volver a ejecutar nada."""
@@ -231,7 +270,9 @@ def construir_metadata(df: pd.DataFrame, modelos: dict) -> dict:
             group: int((df["position_group"] == group).sum())
             for group in FEATURES_BY_GROUP
         },
+        "league_categories": league_categories,
         "r2_cv_by_group": {group: data["r2_cv"] for group, data in modelos.items()},
+        "r2_cv_std_by_group": {group: data["r2_cv_std"] for group, data in modelos.items()},
         "library_versions": {
             "python": platform.python_version(),
             "pandas": pd.__version__,
@@ -250,14 +291,15 @@ def verificar_pkl_guardado(df: pd.DataFrame) -> None:
     SHAP no se haya guardado bien) en el momento, no cuando la app ya este
     desplegada."""
     reloaded = joblib.load(MODEL_OUTPUT_PATH)
+    league_categories = reloaded["metadata"]["league_categories"]
     for group, data in reloaded["models"].items():
         df_group = df[df["position_group"] == group]
         if df_group.empty:
             logger.warning("  [%s] sin filas para el sanity check, se omite", group)
             continue
 
-        features = data["features"]
-        sample = df_group.iloc[[0]][features].fillna(0)
+        sample = construir_matriz(df_group.iloc[[0]], data["base_features"], league_categories)
+        sample = sample.reindex(columns=data["features"], fill_value=0).fillna(0)
 
         pred_eur = float(np.expm1(data["model"].predict(sample)[0]))
         shap_vals = data["explainer"].shap_values(sample)
@@ -271,14 +313,21 @@ def verificar_pkl_guardado(df: pd.DataFrame) -> None:
 
 def run() -> None:
     df = pd.read_csv(DATASET_PATH)
+    df = quitar_columnas_fuga(df)
     validar_columnas(df)
     df["position_group"] = df["position"].apply(get_position_group)
 
-    modelos = {}
-    for group, features in FEATURES_BY_GROUP.items():
-        modelos[group] = entrenar_grupo(df, group, features)
+    # Categorias de liga fijas para TODO el dataset: asi las columnas dummy
+    # de cada grupo/fold/prediccion individual son siempre las mismas,
+    # aunque ese subconjunto no contenga todas las ligas.
+    league_categories = sorted(df[LEAGUE_COLUMN].dropna().unique().tolist())
+    logger.info("Ligas (categorias fijas para el one-hot): %s", league_categories)
 
-    metadata = construir_metadata(df, modelos)
+    modelos = {}
+    for group, base_features in FEATURES_BY_GROUP.items():
+        modelos[group] = entrenar_grupo(df, group, base_features, league_categories)
+
+    metadata = construir_metadata(df, modelos, league_categories)
 
     joblib.dump({
         "models": modelos,
@@ -290,9 +339,9 @@ def run() -> None:
     verificar_pkl_guardado(df)
 
     # ── Resumen final: R2 por posicion ───────────────────────────────
-    print("\n=== R2 (validacion cruzada, media 5 folds) por posicion ===")
+    print("\n=== R2 (validacion cruzada, media +/- desviacion, 5 folds) por posicion ===")
     for group, data in modelos.items():
-        print(f"  {group}: R2 = {data['r2_cv']:.3f}")
+        print(f"  {group}: R2 = {data['r2_cv']:.3f} +/- {data['r2_cv_std']:.3f}")
 
 
 if __name__ == "__main__":
